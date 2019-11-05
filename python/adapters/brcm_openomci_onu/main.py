@@ -23,6 +23,7 @@ import time
 
 import arrow
 import yaml
+import SocketServer
 from packaging.version import Version
 from simplejson import dumps
 from twisted.internet.defer import inlineCallbacks, returnValue
@@ -45,6 +46,7 @@ from pyvoltha.adapters.kafka.kafka_proxy import KafkaProxy, get_kafka_proxy
 from voltha_protos.adapter_pb2 import AdapterConfig
 
 from brcm_openomci_onu import BrcmOpenomciOnuAdapter
+from probe import Probe
 
 defs = dict(
     version_file='./VERSION',
@@ -67,6 +69,7 @@ defs = dict(
     backend=os.environ.get('BACKEND', 'none'),
     retry_interval=os.environ.get('RETRY_INTERVAL', 2),
     heartbeat_topic=os.environ.get('HEARTBEAT_TOPIC', "adapters.heartbeat"),
+    probe=os.environ.get('PROBE', '8080')
 )
 
 
@@ -231,6 +234,13 @@ def parse_args():
                         default=defs['event_topic'],
                         help=_help)
 
+
+    _help = '<hostname>:<port> for liveness and readiness probes (default: %s)' % defs['probe']
+    parser.add_argument(
+        '-P', '--probe', dest='probe', action='store',
+        default=defs['probe'],
+        help=_help)
+
     args = parser.parse_args()
 
     # post-processing
@@ -261,6 +271,10 @@ def print_banner(log):
 
 @implementer(IComponent)
 class Main(object):
+
+    kafka_cluster_proxy_running = False
+    kafka_adapter_proxy_running = False
+    register_adapter_with_core = False
 
     def __init__(self):
 
@@ -352,6 +366,8 @@ class Main(object):
                     config=self.config.get('kafka-cluster-proxy', {})
                 )
             ).start()
+            self.log.info('============kafka cluster proxy running==============')
+            Main.kafka_cluster_proxy_running = True
 
             config = self._get_adapter_config()
 
@@ -386,12 +402,16 @@ class Main(object):
                     target_cls=openonu_request_handler
                 )
             ).start()
+            self.log.info('============kafka adapter proxy running==============')
+	    Main.kafka_adapter_proxy_running = True
 
             self.core_proxy.kafka_proxy = get_messaging_proxy()
             self.adapter_proxy.kafka_proxy = get_messaging_proxy()
 
             # retry for ever
             res = yield self._register_with_core(-1)
+            Main.register_adapter_with_core = True
+            self.log.info('============registered adapter with core==============')
 
             self.log.info('started-internal-services')
 
@@ -417,13 +437,26 @@ class Main(object):
                 t.getName(), "daemon" if t.isDaemon() else "not-daemon"))
             t.join()
 
+    @classmethod
+    def readiness_probe(cls):
+        return (Main.kafka_adapter_proxy_running and Main.kafka_cluster_proxy_running and Main.register_adapter_with_core)
+
+
     def start_reactor(self):
         from twisted.internet import reactor
         reactor.callWhenRunning(
             lambda: self.log.info('twisted-reactor-started'))
         reactor.addSystemEventTrigger('before', 'shutdown',
                                       self.shutdown_components)
+        reactor.callInThread(self.start_probe)
         reactor.run()
+
+    def start_probe(self):
+	args = self.args
+        host = ""
+        port = args.probe
+        server = SocketServer.TCPServer((host, int(port)), Probe)
+        server.serve_forever()
 
     @inlineCallbacks
     def _register_with_core(self, retries):
